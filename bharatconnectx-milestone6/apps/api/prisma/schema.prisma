@@ -1,0 +1,337 @@
+// BharatConnectX.AI — Milestone 1 Schema
+// Core / Multi-tenancy tables. Booking, Marketing, Interactions tables
+// are added in later milestones on top of this same schema file.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BusinessStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+enum UserRole {
+  OWNER
+  STAFF
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  BOOLEAN
+  SELECT
+}
+
+enum InteractionChannel {
+  WHATSAPP
+  VOICE
+  DASHBOARD
+}
+
+enum InteractionDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum ConsentType {
+  MARKETING
+  TRANSACTIONAL
+}
+
+enum AppointmentStatus {
+  BOOKED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum CreatedVia {
+  WHATSAPP
+  DASHBOARD
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  COMPLETED
+  FAILED
+}
+
+enum TemplateApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+/// Tenant root — every table below carries business_id
+model Business {
+  id             String         @id @default(uuid())
+  name           String
+  category       String
+  whatsappNumber String         @unique @map("whatsapp_number")
+  status         BusinessStatus @default(PENDING)
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  users        User[]
+  customers    Customer[]
+  tags         Tag[]
+  customFields CustomField[]
+  services     Service[]
+  segments     Segment[]
+  campaigns    Campaign[]
+  messageTemplates MessageTemplate[]
+  analyticsDailyRollups AnalyticsDailyRollup[]
+
+  @@map("businesses")
+}
+
+/// Business-side dashboard users (owner, staff)
+model User {
+  id            String    @id @default(uuid())
+  businessId    String    @map("business_id")
+  phone         String
+  role          UserRole  @default(STAFF)
+  otpVerifiedAt DateTime? @map("otp_verified_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, phone])
+  @@map("users")
+}
+
+/// One row per end-customer per business
+model Customer {
+  id         String   @id @default(uuid())
+  businessId String   @map("business_id")
+  name       String?
+  phone      String
+  source     String? // e.g. whatsapp, dashboard, qr
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  business   Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  tags       CustomerTag[]
+  interactions Interaction[]
+  consents     Consent[]
+  appointments Appointment[]
+  deliveryLogs DeliveryLog[]
+
+  @@unique([businessId, phone])
+  @@map("customers")
+}
+
+/// Used for CRM segmentation
+model Tag {
+  id         String @id @default(uuid())
+  businessId String @map("business_id")
+  name       String
+
+  business  Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customers CustomerTag[]
+  segments  Segment[]
+
+  @@unique([businessId, name])
+  @@map("tags")
+}
+
+/// Join table — customer <-> tag
+model CustomerTag {
+  customerId String @map("customer_id")
+  tagId      String @map("tag_id")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([customerId, tagId])
+  @@map("customer_tags")
+}
+
+/// Per-industry custom CRM fields (e.g. "Blood Group" for a hospital)
+model CustomField {
+  id         String          @id @default(uuid())
+  businessId String          @map("business_id")
+  fieldName  String          @map("field_name")
+  fieldType  CustomFieldType @map("field_type")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, fieldName])
+  @@map("custom_fields")
+}
+
+/// Every WhatsApp/voice/dashboard touchpoint logs here (spec section 4.4)
+model Interaction {
+  id         String               @id @default(uuid())
+  businessId String               @map("business_id")
+  customerId String               @map("customer_id")
+  channel    InteractionChannel
+  direction  InteractionDirection
+  payload    Json
+  createdAt  DateTime             @default(now()) @map("created_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, customerId])
+  @@map("interactions")
+}
+
+/// Opt-in timestamp — required for WhatsApp marketing compliance (spec section 4.4 / 10)
+model Consent {
+  id          String      @id @default(uuid())
+  customerId  String      @map("customer_id")
+  consentType ConsentType @map("consent_type")
+  grantedAt   DateTime    @default(now()) @map("granted_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, consentType])
+  @@map("consents")
+}
+
+/// What can be booked (spec section 4.2)
+model Service {
+  id          String @id @default(uuid())
+  businessId  String @map("business_id")
+  name        String
+  durationMin Int    @map("duration_min")
+  price       Decimal @db.Decimal(10, 2)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  slots    Slot[]
+
+  @@map("services")
+}
+
+/// is_locked is the DB's record of lock state; the actual mutual-exclusion
+/// during booking happens via a short-lived Redis lock (see
+/// RedisLockService) so two customers can't double-book the same slot
+/// in the race between "check availability" and "confirm".
+model Slot {
+  id        String   @id @default(uuid())
+  serviceId String   @map("service_id")
+  startTime DateTime @map("start_time")
+  endTime   DateTime @map("end_time")
+  isLocked  Boolean  @default(false) @map("is_locked")
+
+  service     Service      @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  appointment Appointment?
+
+  @@index([serviceId, startTime])
+  @@map("slots")
+}
+
+model Appointment {
+  id         String            @id @default(uuid())
+  customerId String            @map("customer_id")
+  slotId     String            @unique @map("slot_id")
+  status     AppointmentStatus @default(BOOKED)
+  createdVia CreatedVia        @map("created_via")
+  createdAt  DateTime          @default(now()) @map("created_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  slot     Slot     @relation(fields: [slotId], references: [id], onDelete: Cascade)
+
+  @@map("appointments")
+}
+
+/// Built on top of CRM tags (spec section 4.3)
+model Segment {
+  id         String @id @default(uuid())
+  businessId String @map("business_id")
+  tagId      String @map("tag_id")
+  filterJson Json?  @map("filter_json")
+  name       String
+
+  business  Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  tag       Tag        @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@map("segments")
+}
+
+/// Mirrors Meta/BSP approval state (spec section 4.3)
+model MessageTemplate {
+  id             String                 @id @default(uuid())
+  businessId     String                 @map("business_id")
+  name           String
+  bodyText       String                 @map("body_text")
+  metaTemplateId String?                @map("meta_template_id")
+  approvalStatus TemplateApprovalStatus @default(PENDING) @map("approval_status")
+
+  business  Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+
+  @@map("message_templates")
+}
+
+model Campaign {
+  id          String         @id @default(uuid())
+  businessId  String         @map("business_id")
+  segmentId   String         @map("segment_id")
+  templateId  String         @map("template_id")
+  scheduledAt DateTime?      @map("scheduled_at")
+  status      CampaignStatus @default(DRAFT)
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  business      Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  segment       Segment         @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  template      MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  deliveryLogs  DeliveryLog[]
+
+  @@map("campaigns")
+}
+
+/// Per-recipient delivery tracking (spec section 4.3)
+model DeliveryLog {
+  id         String         @id @default(uuid())
+  campaignId String         @map("campaign_id")
+  customerId String         @map("customer_id")
+  status     DeliveryStatus @default(QUEUED)
+  sentAt     DateTime?      @map("sent_at")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@map("delivery_logs")
+}
+
+/// One row per business per day — written by the nightly rollup job
+/// (spec section 9, Milestone 6). This is what the dashboard's basic
+/// charts read from, instead of aggregating raw tables on every page
+/// load.
+model AnalyticsDailyRollup {
+  id                       String   @id @default(uuid())
+  businessId               String   @map("business_id")
+  date                     DateTime @db.Date
+  newCustomers             Int      @default(0) @map("new_customers")
+  appointmentsBooked       Int      @default(0) @map("appointments_booked")
+  appointmentsCancelled    Int      @default(0) @map("appointments_cancelled")
+  whatsappMessagesInbound  Int      @default(0) @map("whatsapp_messages_inbound")
+  whatsappMessagesOutbound Int      @default(0) @map("whatsapp_messages_outbound")
+  campaignMessagesSent     Int      @default(0) @map("campaign_messages_sent")
+  computedAt               DateTime @default(now()) @map("computed_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, date])
+  @@map("analytics_daily_rollups")
+}
